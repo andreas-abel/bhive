@@ -39,20 +39,28 @@ uint8_t *hex2bin(char *hex) {
 }
 
 int main(int argc, char **argv) {
+  unsigned int unroll_factor = atoi(argv[argc-1]);
+
   char *code_hex = argv[1];
-  unsigned int unroll_factor = atoi(argv[2]);
   size_t code_size = strlen(code_hex)/2;
   char *code_to_test = hex2bin(code_hex);
+
+  char *init_hex = "";
+  if (argc > 3) {
+    init_hex = argv[2];
+  }
+  size_t code_init_size = strlen(init_hex)/2;
+  char *code_init = hex2bin(init_hex);
 
   // allocate 3 pages, the first one for testing
   // the rest for writing down result
   int shm_fd = create_shm_fd("shm-path");
 
   // `measure` writes the result here
-  int l1_read_supported, l1_write_supported, icache_supported;
+  int l1_read_supported, icache_supported, tlb_write_supported, tlb_read_supported;
   struct pmc_counters *counters = measure(
-      code_to_test, code_size, unroll_factor,
-      &l1_read_supported, &l1_write_supported, &icache_supported, 
+      code_to_test, code_size, unroll_factor, code_init, code_init_size,
+      &l1_read_supported, &icache_supported, &tlb_write_supported, &tlb_read_supported,
       shm_fd);
 
 
@@ -62,14 +70,15 @@ int main(int argc, char **argv) {
   }
 
   // print the result, ignore the first set of counters, which is garbage
-  printf("Core_cyc\tL1_read_misses\tL1_write_misses\tiCache_misses\tContext_switches\n");
+  printf("Core_cyc\tL1_read_misses\tiCache_misses\tTLB_write_misses\tTLB_read_misses\tContext_switches\n");
   int i;
   for (i = 1; i < HARNESS_ITERS; i++) {
-    printf("%ld\t%ld\t%ld\t%ld\t%ld\n",
+    printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\n",
         counters[i].core_cyc,
         l1_read_supported ? counters[i].l1_read_misses : -1,
-        l1_write_supported ? counters[i].l1_write_misses : -1,
         icache_supported ? counters[i].icache_misses : -1,
+        tlb_write_supported ? counters[i].tlb_write_misses : -1,
+        tlb_read_supported ? counters[i].tlb_read_misses : -1,
         counters[i].context_switches);
   }
 

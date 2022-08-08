@@ -56,10 +56,12 @@ extern void map_aux_and_restart();
 // once we've setup the programmable pmcs
 extern char l1_read_misses_a[];
 extern char l1_read_misses_b[];
-extern char l1_write_misses_a[];
-extern char l1_write_misses_b[];
 extern char icache_misses_a[];
 extern char icache_misses_b[];
+extern char tlb_write_misses_a[];
+extern char tlb_write_misses_b[];
+extern char tlb_read_misses_a[];
+extern char tlb_read_misses_b[];
 
 // boundary of the actual test harness
 extern char code_begin[];
@@ -67,6 +69,8 @@ extern char code_end[];
 
 extern char end_tmpl_begin[];
 extern char end_tmpl_end[];
+
+extern char test_end[];
 
 extern char first_legal_aux_mem_access[];
 
@@ -96,6 +100,20 @@ struct perf_event_attr icache_attr = {
     ((PERF_COUNT_HW_CACHE_L1I) |
      (PERF_COUNT_HW_CACHE_OP_READ << 8) |
      (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)),
+  .size = PERF_ATTR_SIZE_VER0,
+  .sample_type = PERF_SAMPLE_READ,
+  .exclude_kernel = 1
+};
+struct perf_event_attr tlb_write_attr = {
+  .type = PERF_TYPE_RAW,
+  .config = 0x2149,
+  .size = PERF_ATTR_SIZE_VER0,
+  .sample_type = PERF_SAMPLE_READ,
+  .exclude_kernel = 1
+};
+struct perf_event_attr tlb_read_attr = {
+  .type = PERF_TYPE_RAW,
+  .config = 0x2108,
   .size = PERF_ATTR_SIZE_VER0,
   .sample_type = PERF_SAMPLE_READ,
   .exclude_kernel = 1
@@ -179,8 +197,9 @@ int is_event_supported(struct perf_event_attr *attr) {
 struct pmc_counters {
   uint64_t core_cyc;
   uint64_t l1_read_misses;
-  uint64_t l1_write_misses;
   uint64_t icache_misses;
+  uint64_t tlb_write_misses;
+  uint64_t tlb_read_misses;
   uint64_t context_switches;
 };
 
@@ -189,9 +208,12 @@ struct pmc_counters *measure(
     char *code_to_test,
     unsigned long code_size,
     unsigned int unroll_factor,
+    char *code_init,
+    unsigned long code_init_size,
     int *l1_read_supported,
-    int *l1_write_supported,
     int *icache_supported,
+    int *tlb_write_supported,
+    int *tlb_read_supported,
     int shm_fd) {
   int fds[2];
   pipe(fds);
@@ -211,8 +233,9 @@ struct pmc_counters *measure(
 
     // find out which PMCs are supported
     *l1_read_supported = is_event_supported(&l1_read_attr);
-    *l1_write_supported = is_event_supported(&l1_write_attr);
     *icache_supported = is_event_supported(&icache_attr);
+    *tlb_write_supported = is_event_supported(&tlb_write_attr);
+    *tlb_read_supported = is_event_supported(&tlb_read_attr);
 
     char *last_failing_inst = 0;
 
@@ -278,13 +301,17 @@ struct pmc_counters *measure(
     int l1_read_misses_idx = ctx.buf->index - 1;
     LOG("L1 READ IDX = %d\n", ctx.buf->index);
 
-    rdpmc_open_attr(&l1_write_attr, &ctx, 0);
-    int l1_write_misses_idx = ctx.buf->index - 1;
-    LOG("L1 WRITE IDX = %d\n", ctx.buf->index);
-
     rdpmc_open_attr(&icache_attr, &ctx, 0);
     int icache_misses_idx = ctx.buf->index - 1;
     LOG("ICACHE IDX = %d\n", ctx.buf->index);
+
+    rdpmc_open_attr(&tlb_write_attr, &ctx, 0);
+    int tlb_write_misses_idx = ctx.buf->index - 1;
+    LOG("TLB WRITE IDX = %d\n", ctx.buf->index);
+
+    rdpmc_open_attr(&tlb_read_attr, &ctx, 0);
+    int tlb_read_misses_idx = ctx.buf->index - 1;
+    LOG("TLB READ IDX = %d\n", ctx.buf->index);
 
     int ret = rdpmc_open_attr(&ctx_swtch_attr, &ctx, 0);
     if (ret != 0) {
@@ -294,10 +321,20 @@ struct pmc_counters *measure(
     dup2(ctx.fd, CTX_SWTCH_FD);
 
     unsigned long end_tmpl_size = end_tmpl_end - end_tmpl_begin;
-    unsigned long total_code_size =
-      code_size * unroll_factor + end_tmpl_size + SIZE_OF_REL_JUMP;
 
-    // unprotect the test harness 
+    /*unsigned char issue_group_alignment[] = {0x88, 0xe4, // mov ah, ah
+                                             0x48, 0x89, 0xc0, // mov rax, rax
+                                             0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}; // 7*nop //ToDo: this works on HSW, but does not seem to work on CFL in the same way
+    */
+
+    unsigned long lfence_size = 3;
+    unsigned long nops = (64 - (((unsigned long)code_end + code_init_size + lfence_size) % 64)) % 64; //(64 - (((unsigned long)code_end + code_init_size + lfence_size + sizeof(issue_group_alignment)) % 64)) % 64;
+    unsigned long total_code_size =
+      code_init_size + nops + lfence_size + code_size * unroll_factor + end_tmpl_size + SIZE_OF_REL_JUMP + 1920;
+
+    LOG("code_end = %p\n", code_end);
+
+    // unprotect the test harness
     // so that we can emit instructions to use
     // the proper pmc index
     char *begin = round_to_page_start(code_begin);
@@ -308,14 +345,56 @@ struct pmc_counters *measure(
 
     emit_mov_rcx(l1_read_misses_a, l1_read_misses_idx);
     emit_mov_rcx(l1_read_misses_b, l1_read_misses_idx);
-    emit_mov_rcx(l1_write_misses_a, l1_write_misses_idx);
-    emit_mov_rcx(l1_write_misses_b, l1_write_misses_idx);
     emit_mov_rcx(icache_misses_a, icache_misses_idx);
     emit_mov_rcx(icache_misses_b, icache_misses_idx);
+    emit_mov_rcx(tlb_write_misses_a, tlb_write_misses_idx);
+    emit_mov_rcx(tlb_write_misses_b, tlb_write_misses_idx);
+    emit_mov_rcx(tlb_read_misses_a, tlb_read_misses_idx);
+    emit_mov_rcx(tlb_read_misses_b, tlb_read_misses_idx);
 
-    // copy the *unrolled* user code 
+    // copy the *unrolled* user code
     unsigned char *code_dest = code_end;
+
+    memcpy(code_dest, code_init, code_init_size);
+    code_dest += code_init_size;
+
     int i;
+    for (i = 0; i < nops; i++) {
+      *code_dest = 0x90;
+      code_dest++;
+    }
+
+    code_dest[0] = 0x0f;
+    code_dest[1] = 0xae;
+    code_dest[2] = 0xe8;
+    code_dest += lfence_size;
+
+    /*
+    for (i = 0; i < sizeof(issue_group_alignment); i++) {
+      *code_dest = issue_group_alignment[i];
+      code_dest++;
+    }*/
+
+
+    for (i = 0; i < 128; i++) {
+      code_dest[i*15+0] = 0x66;
+      code_dest[i*15+1] = 0x66;
+      code_dest[i*15+2] = 0x66;
+      code_dest[i*15+3] = 0x66;
+      code_dest[i*15+4] = 0x66;
+      code_dest[i*15+5] = 0x66;
+      code_dest[i*15+6] = 0x2e;
+      code_dest[i*15+7] = 0x0f;
+      code_dest[i*15+8] = 0x1f;
+      code_dest[i*15+9] = 0x84;
+      code_dest[i*15+10] = 0x00;
+      code_dest[i*15+11] = 0x00;
+      code_dest[i*15+12] = 0x00;
+      code_dest[i*15+13] = 0x00;
+      code_dest[i*15+14] = 0x00;
+    }
+    code_dest += 1920;
+
     for (i = 0; i < unroll_factor; i++) {
       memcpy(code_dest, code_to_test, code_size);
       code_dest += code_size;
@@ -327,7 +406,7 @@ struct pmc_counters *measure(
 
     // insert a rel. jump that brings us back to test_end
     *code_dest = 0xe9;
-    *(int *)(code_dest+1) = -(total_code_size + SIZE_OF_REL_JUMP);
+    *(int *)(code_dest+1) = -(total_code_size + (code_end - test_end));
 
     // re-protect the harness
     errno = 0;
